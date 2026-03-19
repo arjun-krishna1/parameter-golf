@@ -61,9 +61,12 @@ class Hyperparameters:
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 9))
+    # Add hyper parameters for core depth recurrence
+    num_core_layers = int(os.environ.get("NUM_CORE_LAYERS", 3))
+    num_loops = int(os.environ.get("NUM_LOOPS", 5))
+    depth_lora_rank = int(os.environ.get("DEPTH_LORA_RANK", 0))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
-    model_dim = int(os.environ.get("MODEL_DIM", 512))
+    model_dim = int(os.environ.get("MODEL_DIM", 704))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
@@ -649,7 +652,6 @@ class GPT(nn.Module):
     def __init__(
         self,
         vocab_size: int,
-        num_layers: int,
         model_dim: int,
         num_heads: int,
         num_kv_heads: int,
@@ -659,6 +661,9 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        num_core_layers: int = 3,
+        num_loops: int = 5,
+        depth_lora_rank: int = 0,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -667,11 +672,22 @@ class GPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
-        self.num_encoder_layers = num_layers // 2
-        self.num_decoder_layers = num_layers - self.num_encoder_layers
+
+        # Initialize core depth recurrence params
+        self.num_core_layers = num_core_layers
+        self.num_loops = num_loops
+        self.depth_lora_rank = depth_lora_rank
+        total_effective = num_core_layers * num_loops
+
+
+        self.num_encoder_layers = total_effective // 2
+        self.num_decoder_layers = total_effective - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
-        self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
-        self.blocks = nn.ModuleList(
+        self.skip_weights = nn.Parameter(
+            torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32)
+        )
+
+        self.core_blocks = nn.ModuleList(
             [
                 Block(
                     model_dim,
@@ -681,9 +697,12 @@ class GPT(nn.Module):
                     rope_base,
                     qk_gain_init,
                 )
-                for i in range(num_layers)
+                for i in range(num_core_layers)
             ]
         )
+
+        self.layer_embeds = nn.Parameter(torch.zeros(total_effective, model_dim))
+
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
@@ -703,15 +722,21 @@ class GPT(nn.Module):
         x0 = x
         skips: list[Tensor] = []
 
-        # First half stores skips; second half reuses them in reverse order.
-        for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
-            skips.append(x)
-        for i in range(self.num_decoder_layers):
-            if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+        total_effective = self.num_core_layers * self.num_loops
+        for v in range(total_effective):
+            block_idx = v % self.num_core_layers
 
+            if v < self.num_encoder_layers:
+                x = x + self.layer_embeds[v].to(dtype=x.dtype)[None, None, :]
+                x = self.core_blocks[block_idx](x, x0)
+                skips.append(x)
+            else:
+                decoder_idx = v - self.num_encoder_layers
+                if decoder_idx < self.num_skip_weights and skips:
+                    x = x + self.skip_weights[decoder_idx].to(dtype=x.dtype)[None, None, :] * skips.pop()
+                x = x + self.layer_embeds[v].to(dtype=x.dtype)[None, None, :]
+                x = self.core_blocks[block_idx](x, x0)
+        
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
         if self.tie_embeddings:
@@ -825,7 +850,6 @@ def main() -> None:
 
     base_model = GPT(
         vocab_size=args.vocab_size,
-        num_layers=args.num_layers,
         model_dim=args.model_dim,
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
@@ -835,6 +859,9 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        num_core_layers=args.num_core_layers,
+        num_loops=args.num_loops,
+        depth_lora_rank=args.depth_lora_rank,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -848,7 +875,7 @@ def main() -> None:
     # - untied lm_head (Adam) uses HEAD_LR
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
-    block_named_params = list(base_model.blocks.named_parameters())
+    block_named_params = list(base_model.core_blocks.named_parameters())
     matrix_params = [
         p
         for name, p in block_named_params
@@ -861,6 +888,7 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
+    scalar_params.append(base_model.layer_embeds)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -908,6 +936,18 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+    log0(
+        f"depth_recurrence: core_layers:{base_model.num_core_layers} "
+        f"loops:{base_model.num_loops} effective_depth:{base_model.num_core_layers * base_model.num_loops} "
+        f"skip_weights:{base_model.num_skip_weights} "
+        f"layer_embeds:{base_model.layer_embeds.shape}"
+    )
+    log0(
+        f"param_breakdown: core_blocks:{sum(p.numel() for p in base_model.core_blocks.parameters())} "
+        f"tok_emb:{base_model.tok_emb.weight.numel()} "
+        f"skip_weights:{base_model.skip_weights.numel()} "
+        f"layer_embeds:{base_model.layer_embeds.numel()}"
+    )
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
