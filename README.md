@@ -189,6 +189,14 @@ This repository adapts code from `modded-nanogpt`, see [THIRD_PARTY_NOTICES.md](
 
 ## Experiment Log
 
+### Experiment 0: Baseline Run (8xH100, sp1024)
+
+- Config: 9-layer, 512-dim, 1024 vocab, tied embeddings, GQA (8 heads / 4 KV), seed 1337. 524,288 batch tokens, 1024 seq len, 20k iterations max, 600s wallclock cap.
+- Params: 17,059,912
+- Result: Hit wallclock cap at step 11,701/20,000 (~600s). Final val_bpb 1.2228 (pre-roundtrip), **1.2298 after int8+zlib roundtrip**. val_loss 2.0764.
+- Artifact size: 15,809,501 B compressed (int8+zlib), 15,857,187 B total submission (incl. code). Comfortably under the 16MB cap with ~143 KB to spare.
+- Notes: Loss was still decreasing when wallclock hit — more steps would likely help. Step avg drifted from ~44ms to ~51ms over the run. The int8+zlib roundtrip costs ~0.007 bpb (1.2228 → 1.2298).
+
 ### Experiment 1: zstd vs zlib Compression for Model Artifact
 
 - Hypothesis: The baseline pipeline compresses the int8 model checkpoint with zlib. zstd (Zstandard) is a newer compression algorithm that often achieves better ratios on binary data. Switching to zstd could reclaim bytes within the 16MB artifact cap, effectively allowing more parameters for the same budget.
