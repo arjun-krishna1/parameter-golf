@@ -221,3 +221,81 @@ Raw uncompressed size: 17,224,025 bytes (17.22 MB).
 Best result was **zstd level 3**, saving ~31.8 KB over zlib — enough room for roughly 31,783 extra int8 parameters.
 
 - Recommendation: The savings are real but modest (~0.2% of the artifact size). Worth adopting if we're pushing right up against the 16MB cap and need every byte, since the code change is trivial (swap `zlib.compress` for `zstd.ZstdCompressor(level=3).compress`). However, if we're comfortably under budget, the complexity of adding a `zstandard` dependency isn't justified — the ~32K of freed space is unlikely to meaningfully move val_bpb on its own.
+
+### Experiment 2: Recurrence & Wider Model (3×5 loops, 704d)
+
+- Hypothesis: Depth recurrence (looping a small set of unique transformer blocks multiple times) lets you trade unique parameters for effective depth. Using fewer unique layers at a wider hidden dimension could improve per-step learning quality enough to offset the higher per-step cost.
+
+- Setup: 3 unique core layers looped 5 times (15 effective layers), 704-dim, same 1024 vocab / tied embeddings / GQA setup. 8xH100, 600s wallclock cap.
+
+- Results:
+
+| | Baseline | Recurrence (3×5, 704d) |
+|---|---|---|
+| **final val_bpb (int8)** | **1.2298** | **1.2874** |
+| Steps completed | 11,701 | 4,768 |
+| step_avg | ~51ms | ~126ms |
+| int8+zlib size | 15.8 MB | 10.3 MB |
+
+- Outcome: **The recurrence model lost by 0.058 bpb.** It completed only 41% of training steps (4,768 vs 11,701) because each step is ~2.5× more expensive. The wider model learns better per-step, but not nearly enough to compensate for 59% fewer steps.
+
+- Positive: Compressed size is only 10.3 MB — **5.7 MB of headroom** under the 16 MB limit. The architecture works correctly. This is purely a speed-vs-quality tradeoff problem.
+
+- Next steps: The core issue is that 15 effective layers at 704d costs too many FLOPs. Need to reduce per-step cost while keeping the width advantage.
+
+  1. **3×3 at 704d** — 9 effective layers (same as baseline), 704d wide, 3 unique blocks. FLOPs ratio vs baseline: `9 × 704² / (9 × 512²) ≈ 1.89×`. Estimated ~94ms/step, ~6,400 steps. Still 45% fewer steps than baseline, but per-step learning at 704d might compensate.
+  2. **3×3 at 576d** — 9 effective layers, 576d, 3 unique blocks. FLOPs ratio: `9 × 576² / (9 × 512²) ≈ 1.27×`. Estimated ~63ms/step, ~9,500 steps. Only 19% fewer steps than baseline; modest width gain but nearly the same training budget. ~7.6M params, compresses to ~7 MB.
+  3. **4×2 at 704d** — 8 effective layers, 704d, 4 unique blocks. More unique blocks gives more representational diversity (the main weakness of 3 shared blocks). FLOPs ratio: `8 × 704² / (9 × 512²) ≈ 1.68×`. Estimated ~84ms/step, ~7,100 steps. ~14.6M params, compresses to ~13 MB.
+
+  Recommended order: Option 1 first (most direct test of width-for-speed), then Option 2 (conservative fallback with near-baseline step count) if it loses.
+
+### Experiment 3: Recurrence with Reduced Depth (3×3 loops, 704d)
+
+- Hypothesis: The 3×5 config lost because 15 effective layers at 704d was too expensive per step (~126ms), limiting total training steps. Reducing to 3×3 (9 effective layers — same depth as baseline) at 704d should cut per-step cost enough to get significantly more steps, while keeping the width advantage.
+
+- Setup: 3 unique core layers looped 3 times (9 effective layers), 704-dim, same 1024 vocab / tied embeddings / GQA setup. 8xH100, 600s wallclock cap.
+
+- Results:
+
+| | Baseline | 3×5 (704d) | 3×3 (704d) |
+|---|---|---|---|
+| **final val_bpb (int8)** | **1.2298** | **1.2874** | **1.2938** |
+| Steps completed | 11,701 | 4,768 | 7,286 |
+| step_avg | ~51ms | ~126ms | ~82ms |
+| int8+zlib size | 15.8 MB | 10.3 MB | 10.3 MB |
+| model_params | 17.1M | 11.2M | 11.1M |
+
+- Val bpb trajectory (vs baseline at same step count):
+
+| Step | Baseline | 3×3 (704d) | Gap |
+|------|----------|------------|-----|
+| 1000 | 1.3839 | 1.4334 | +0.050 |
+| 2000 | 1.3244 | 1.3730 | +0.049 |
+| 3000 | 1.3001 | 1.3482 | +0.048 |
+| 4000 | 1.2849 | 1.3336 | +0.049 |
+| 5000 | 1.2748 | 1.3239 | +0.049 |
+| 6000 | 1.2689 | 1.3187 | +0.050 |
+| 7000 | 1.2625 | 1.2921 | +0.030 |
+
+- Outcome: **The 3×3 config lost by 0.064 bpb — worse than the 3×5.** Despite getting 53% more steps than 3×5 (7,286 vs 4,768), the shallower depth (9 vs 15 effective layers) lost more quality than the extra steps recovered. Step time (~82ms) was 1.6× baseline, not the estimated 1.89×, confirming FLOPs-to-walltime scaling is sublinear.
+
+- Key insight: **3 unique blocks is the bottleneck, not depth or width.** The 3×3 was consistently ~0.05 bpb worse than baseline at every step count. This gap was nearly constant from step 1000 to 6000, meaning the model's per-step learning efficiency is fundamentally capped by having only 3 distinct transformer blocks. The wider dimension (704 vs 512) does not compensate for the lost representational diversity of going from 9 unique blocks to 3.
+
+- Implication: Depth recurrence with very few unique blocks (3) is a dead end for beating this baseline. The parameter savings (5.7 MB headroom) are real but unusable — the model can't learn as efficiently per step regardless of how many extra steps it gets.
+
+### Next Steps — Strategy Reassessment
+
+The recurrence experiments (3×5 and 3×3 at 704d) established clear findings:
+1. **Width at the expense of unique blocks does not pay off.** 704d × 3 unique blocks is consistently ~0.05 bpb/step worse than 512d × 9 unique blocks.
+2. **Depth via recurrence helps per-step quality** (3×5 beat 3×3 in final bpb despite fewer steps), but the compute cost eliminates the advantage.
+3. **Step time dominance**: Within a fixed wallclock budget, total steps completed is the primary driver of final quality. Any config that significantly slows step time loses.
+
+Promising directions to explore:
+
+1. **Wider baseline without recurrence** — Keep 9 unique layers, increase model_dim from 512 to 544–576. No recurrence overhead, so step time stays closer to baseline (~57–65ms). Tests whether width helps when unique block count is held constant at 9. ~12–13M params, compresses to ~12 MB (comfortably under 16 MB). This isolates the width variable.
+
+2. **Recurrence with more unique blocks** — e.g. 5×2 at 512d (10 effective layers, 5 unique blocks, ~57ms/step) or 6×2 at 512d (12 effective, 6 unique, ~68ms/step). More unique blocks should close the per-step quality gap while still benefiting from mild recurrence.
+
+3. **Orthogonal improvements** — Learning rate schedule tuning, sequence length changes at eval time, tokenizer experiments, or other strategies mentioned in the challenge description (test-time compute, QAT, etc.) that don't require the recurrence architecture to work.
+
+Recommended order: Option 1 first (simplest test, isolates width vs block count), then Option 2 if width alone helps.
