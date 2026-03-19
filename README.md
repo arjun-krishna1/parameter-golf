@@ -184,3 +184,32 @@ The `train_gpt.py` and `train_gpt_mlx.py` scripts are intended as good launching
 Join the [OpenAI Discord server](https://discord.com/invite/openai) and visit the Parameter Golf channels (#parameter-golf-discussions, #parameter-golf-announcements) and ask questions.
 
 This repository adapts code from `modded-nanogpt`, see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for attribution.
+
+---
+
+## Experiment Log
+
+### Experiment 1: zstd vs zlib Compression for Model Artifact
+
+- Hypothesis: The baseline pipeline compresses the int8 model checkpoint with zlib. zstd (Zstandard) is a newer compression algorithm that often achieves better ratios on binary data. Switching to zstd could reclaim bytes within the 16MB artifact cap, effectively allowing more parameters for the same budget.
+
+- Setup: Decompressed the baseline `final_model.int8.ptz` (zlib-compressed) back to raw bytes, then recompressed with zstd at levels 1–22. Compared output sizes against the original zlib blob. See `compression_comparison.py`.
+
+- Results:
+
+| Format | Level | Compressed Size | Savings vs zlib |
+|--------|------:|----------------:|----------------:|
+| zlib (baseline) | default | 15,809,501 B | — |
+| zstd | 1 | 15,787,382 B | 22,119 B |
+| zstd | 3 | **15,777,718 B** | **31,783 B** |
+| zstd | 6 | 15,780,078 B | 29,423 B |
+| zstd | 10 | 15,779,708 B | 29,793 B |
+| zstd | 15 | 15,779,077 B | 30,424 B |
+| zstd | 19 | 15,780,855 B | 28,646 B |
+| zstd | 22 | 15,780,870 B | 28,631 B |
+
+Raw uncompressed size: 17,224,025 bytes (17.22 MB).
+
+Best result was **zstd level 3**, saving ~31.8 KB over zlib — enough room for roughly 31,783 extra int8 parameters.
+
+- Recommendation: The savings are real but modest (~0.2% of the artifact size). Worth adopting if we're pushing right up against the 16MB cap and need every byte, since the code change is trivial (swap `zlib.compress` for `zstd.ZstdCompressor(level=3).compress`). However, if we're comfortably under budget, the complexity of adding a `zstandard` dependency isn't justified — the ~32K of freed space is unlikely to meaningfully move val_bpb on its own.
