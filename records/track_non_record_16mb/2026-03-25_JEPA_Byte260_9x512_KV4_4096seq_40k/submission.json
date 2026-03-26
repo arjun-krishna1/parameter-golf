@@ -1,0 +1,17 @@
+{
+  "author": "Arjun Krishna",
+  "github_id": "arjun-krishna1",
+  "name": "JEPA Byte-260 9x512 KV4 seq4096 40k",
+  "blurb": "Non-record track: first JEPA (Joint Embedding Predictive Architecture) submission. Byte-level tokenization (vocab 260, no SentencePiece), seq_len=4096, 40k steps on 50 FineWeb shards (~12.2B unique byte tokens). JEPA auxiliary loss (lambda=0.1) predicts next hidden representation via a linear predictor head with stop-gradient target. Post-quant int8+zlib roundtrip: 1.2093 BPB, beating the naive SP-1024 baseline of 1.2244.",
+  "date": "2026-03-25T00:00:00Z",
+  "track": "non-record-unlimited-compute-16mb",
+  "val_loss": 0.83821145,
+  "val_bpb": 1.20928350,
+  "pre_quant_val_loss": 0.8354,
+  "pre_quant_val_bpb": 1.2052,
+  "step_stop": 40000,
+  "wallclock_seconds": 38331.750,
+  "bytes_total": 15305275,
+  "bytes_model_int8_zlib": 15257475,
+  "bytes_code": 47800
+}
